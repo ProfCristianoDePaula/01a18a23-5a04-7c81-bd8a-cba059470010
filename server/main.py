@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import os
 import re
-import secrets
 import shutil
 import sqlite3
 import subprocess
 import tempfile
 import uuid
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Annotated
 
@@ -22,9 +19,10 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+import httpx
 from openai import OpenAI
 from PIL import Image
 
@@ -37,15 +35,13 @@ UPLOAD_ROOT = DATA_ROOT / "uploads"
 OUTPUT_ROOT = DATA_ROOT / "documents"
 MAX_UPLOAD_BYTES = int(os.getenv("FIO_MAX_UPLOAD_MB", "500")) * 1024 * 1024
 MAX_UNPACKED_BYTES = int(os.getenv("FIO_MAX_UNPACKED_MB", "2048")) * 1024 * 1024
-COOKIE_NAME = "fio_session"
-COOKIE_SECURE = os.getenv("FIO_COOKIE_SECURE", "false").lower() == "true"
-COOKIE_SAMESITE = os.getenv("FIO_COOKIE_SAMESITE", "lax").lower()
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv(
     "FIO_ALLOWED_ORIGINS",
     "http://localhost:5173,http://127.0.0.1:5173,https://localhost,capacitor://localhost",
 ).split(",") if origin.strip()]
 TRANSCRIPTION_MODEL = os.getenv("FIO_TRANSCRIPTION_MODEL", "gpt-transcribe")
-SESSION_DAYS = int(os.getenv("FIO_SESSION_DAYS", "7"))
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 MONTHS = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
 HEADER_RE = re.compile(r"^(\d{2}/\d{2}/\d{4}) (\d{2}:\d{2}) - (.*)$")
 IMAGE_RE = re.compile(r"((?:IMG|STK)-[^\s<>]+\.(?:jpg|jpeg|png|webp))", re.IGNORECASE)
@@ -61,7 +57,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -112,52 +108,48 @@ def init_db() -> None:
 init_db()
 
 
-def hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
-    actual_salt = salt or secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), actual_salt, 390_000)
-    return digest.hex(), actual_salt.hex()
-
-
-def verify_password(password: str, salt_hex: str, expected_hex: str) -> bool:
-    actual, _ = hash_password(password, bytes.fromhex(salt_hex))
-    return hmac.compare_digest(actual, expected_hex)
-
-
-def issue_session(response: Response, user_id: str) -> None:
-    token = secrets.token_urlsafe(48)
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-    expires = utc_now() + timedelta(days=SESSION_DAYS)
-    with db() as con:
-        con.execute(
-            "INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)",
-            (token_hash, user_id, expires.isoformat()),
-        )
-    response.set_cookie(
-        COOKIE_NAME,
-        token,
-        httponly=True,
-        secure=COOKIE_SECURE,
-        samesite=COOKIE_SAMESITE,
-        max_age=SESSION_DAYS * 24 * 60 * 60,
-        path="/",
-    )
-
-
 def current_user(request: Request) -> dict:
-    token = request.cookies.get(COOKIE_NAME)
-    if not token:
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
         raise HTTPException(401, "Entre ou crie uma conta para continuar.")
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-    with db() as con:
-        row = con.execute(
-            "SELECT u.id,u.name,u.email,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?",
-            (token_hash,),
-        ).fetchone()
-        if not row:
-            raise HTTPException(401, "Sessão expirada. Entre novamente.")
-        if datetime.fromisoformat(row["expires_at"]) <= utc_now():
-            con.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash,))
-            raise HTTPException(401, "Sessão expirada. Entre novamente.")
+    if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
+        raise HTTPException(503, "A autenticação Supabase ainda não foi configurada no servidor.")
+    try:
+        response = httpx.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={"apikey": SUPABASE_PUBLISHABLE_KEY, "Authorization": f"Bearer {token}"},
+            timeout=8.0,
+        )
+    except httpx.HTTPError:
+        raise HTTPException(503, "Não foi possível validar sua sessão no Supabase.")
+    if response.status_code != 200:
+        raise HTTPException(401, "Sessão inválida ou expirada. Entre novamente.")
+    identity = response.json()
+    user_id = str(identity.get("id", ""))
+    email = str(identity.get("email", "")).strip().lower()
+    if not user_id or not email:
+        raise HTTPException(401, "A conta Supabase não retornou uma identidade válida.")
+    metadata = identity.get("user_metadata") or {}
+    name = str(metadata.get("name") or email.split("@", 1)[0])[:100]
+    now = utc_now().isoformat()
+    try:
+        with db() as con:
+            row = con.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+            if not row:
+                row = con.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+            local_id = row["id"] if row else user_id
+            if not row:
+                con.execute(
+                    "INSERT INTO users(id,name,email,password_hash,password_salt,created_at) VALUES(?,?,?,?,?,?)",
+                    (local_id, name, email, "", "", now),
+                )
+            con.execute("UPDATE users SET name=?,email=? WHERE id=?", (name, email, local_id))
+            row = con.execute("SELECT id,name,email FROM users WHERE id=?", (local_id,)).fetchone()
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Já existe uma conta local com este e-mail. Contate o suporte.")
+    if not row:
+        raise HTTPException(409, "Não foi possível associar a conta ao histórico local.")
     return dict(row)
 
 
@@ -166,56 +158,11 @@ CurrentUser = Annotated[dict, Depends(current_user)]
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "transcription_configured": bool(os.getenv("OPENAI_API_KEY"))}
-
-
-@app.post("/api/auth/register")
-def register(
-    response: Response,
-    name: Annotated[str, Form(min_length=1, max_length=100)],
-    email: Annotated[str, Form(min_length=3, max_length=254)],
-    password: Annotated[str, Form(min_length=8, max_length=200)],
-) -> dict:
-    clean_email = email.strip().lower()
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", clean_email):
-        raise HTTPException(422, "Informe um e-mail válido.")
-    password_hash, password_salt = hash_password(password)
-    user_id = str(uuid.uuid4())
-    try:
-        with db() as con:
-            con.execute(
-                "INSERT INTO users(id,name,email,password_hash,password_salt,created_at) VALUES(?,?,?,?,?,?)",
-                (user_id, name.strip(), clean_email, password_hash, password_salt, utc_now().isoformat()),
-            )
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, "Já existe uma conta com esse e-mail.")
-    issue_session(response, user_id)
-    return {"id": user_id, "name": name.strip(), "email": clean_email}
-
-
-@app.post("/api/auth/login")
-def login(
-    response: Response,
-    email: Annotated[str, Form()],
-    password: Annotated[str, Form()],
-) -> dict:
-    clean_email = email.strip().lower()
-    with db() as con:
-        user = con.execute("SELECT * FROM users WHERE email=?", (clean_email,)).fetchone()
-    if not user or not verify_password(password, user["password_salt"], user["password_hash"]):
-        raise HTTPException(401, "E-mail ou senha inválidos.")
-    issue_session(response, user["id"])
-    return {"id": user["id"], "name": user["name"], "email": user["email"]}
-
-
-@app.post("/api/auth/logout")
-def logout(request: Request, response: Response) -> dict:
-    token = request.cookies.get(COOKIE_NAME)
-    if token:
-        with db() as con:
-            con.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
-    response.delete_cookie(COOKIE_NAME, path="/")
-    return {"ok": True}
+    return {
+        "status": "ok",
+        "transcription_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY),
+    }
 
 
 @app.get("/api/me")

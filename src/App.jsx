@@ -23,6 +23,7 @@ import {
   X,
 } from 'lucide-react'
 import './App.css'
+import { supabase } from './lib/supabase'
 
 const MAX_FILE_SIZE = 500 * 1024 * 1024
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '')
@@ -59,7 +60,10 @@ function App() {
   const [jobs, setJobs] = useState([])
 
   const api = useCallback(async (path, options = {}) => {
-    const response = await fetch(apiUrl(path), { credentials: 'include', ...options })
+    const { data: { session } } = supabase ? await supabase.auth.getSession() : { data: { session: null } }
+    const headers = new Headers(options.headers || {})
+    if (session?.access_token) headers.set('Authorization', `Bearer ${session.access_token}`)
+    const response = await fetch(apiUrl(path), { ...options, headers })
     if (!response.ok) {
       let message = `Erro ${response.status}`
       try { message = (await response.json()).detail || message } catch { /* resposta sem JSON */ }
@@ -71,7 +75,18 @@ function App() {
   }, [])
 
   const loadAccount = useCallback(async () => {
+    if (!supabase) {
+      setUser(null)
+      setJobs([])
+      return
+    }
     try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) {
+        setUser(null)
+        setJobs([])
+        return
+      }
       const account = await api('/api/me')
       setUser(account)
       const documents = await api('/api/jobs')
@@ -84,7 +99,13 @@ function App() {
 
   useEffect(() => {
     const timer = window.setTimeout(loadAccount, 0)
-    return () => window.clearTimeout(timer)
+    const { data: { subscription } } = supabase?.auth.onAuthStateChange(() => {
+      window.setTimeout(loadAccount, 0)
+    }) || { data: { subscription: null } }
+    return () => {
+      window.clearTimeout(timer)
+      subscription?.unsubscribe()
+    }
   }, [loadAccount])
 
   useEffect(() => {
@@ -140,10 +161,26 @@ function App() {
     event.preventDefault()
     setBusy(true)
     const form = new FormData(event.currentTarget)
-    const endpoint = authMode === 'signup' ? '/api/auth/register' : '/api/auth/login'
     try {
-      const account = await api(endpoint, { method: 'POST', body: form })
-      setUser(account)
+      if (!supabase) throw new Error('Configuração Supabase ausente. Confira as variáveis VITE_SUPABASE_URL e VITE_SUPABASE_PUBLISHABLE_KEY.')
+      const email = String(form.get('email') || '').trim()
+      const password = String(form.get('password') || '')
+      if (authMode === 'signup') {
+        const name = String(form.get('name') || '').trim()
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { data: { name }, emailRedirectTo: window.location.origin },
+        })
+        if (error) throw error
+        if (!data.session) {
+          setModalNotice('Conta criada. Confirme seu e-mail pelo link enviado e depois entre no DocumentAI.')
+          return
+        }
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password })
+        if (error) throw error
+      }
       await loadAccount()
       setNotice(authMode === 'signup' ? 'Conta criada. Agora envie o ZIP para preparar o documento.' : 'Você entrou na plataforma.')
       setModalNotice('')
@@ -166,7 +203,7 @@ function App() {
   }
 
   async function signOut() {
-    try { await api('/api/auth/logout', { method: 'POST' }) } catch { /* encerra a interface local de qualquer forma */ }
+    try { await supabase?.auth.signOut() } catch { /* encerra a interface local de qualquer forma */ }
     setUser(null)
     setJobs([])
     setNotice('Você saiu da sua conta.')
